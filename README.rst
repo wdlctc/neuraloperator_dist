@@ -28,9 +28,18 @@ Installation
 
 Just clone the repository and install locally (in editable mode so changes in the code are immediately reflected without having to reinstall):
 
+prepare
+
 .. code::
 
-  git clone https://github.com/NeuralOperator/neuraloperator
+  git clone https://github.com/wdlctc/tltorch
+  cd torch
+  pip install -e .
+  cd ..
+
+.. code::
+
+  git clone https://github.com/wdlctc/neuraloperator
   cd neuraloperator
   pip install -e .
   pip install -r requirements.txt

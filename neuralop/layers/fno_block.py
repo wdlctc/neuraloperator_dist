@@ -3,6 +3,7 @@ from typing import List, Optional, Union
 import torch
 from torch import nn
 import torch.nn.functional as F
+import math
 
 from .mlp import MLP
 from .normalization_layers import AdaIN
@@ -10,10 +11,65 @@ from .skip_connections import skip_connection
 from .spectral_convolution import SpectralConv
 from ..utils import validate_scaling_factor
 
+import torch.distributed as dist
 
 Number = Union[int, float]
 
+def _all_to_all(
+    input_: torch.Tensor,
+    world_size: int,
+    group: dist.ProcessGroup,
+    scatter_dim: int,
+    gather_dim: int,
+):
+    input_list = [t.contiguous() for t in torch.tensor_split(input_, world_size, scatter_dim)]
+    output_list = [torch.empty_like(input_list[0]) for _ in range(world_size)]
+    dist.all_to_all(output_list, input_list, group=group)
+    return torch.cat(output_list, dim=gather_dim).contiguous()
+    
+class _AllToAll(torch.autograd.Function):
+    """All-to-all communication.
 
+    Args:
+        input_: input matrix
+        process_group: communication group
+        scatter_dim: scatter dimension
+        gather_dim: gather dimension
+    """
+
+    @staticmethod
+    def forward(ctx, input_, process_group, scatter_dim, gather_dim):
+        ctx.process_group = process_group
+        ctx.scatter_dim = scatter_dim
+        ctx.gather_dim = gather_dim
+        ctx.world_size = dist.get_world_size(process_group)
+        output = _all_to_all(input_, ctx.world_size, process_group, scatter_dim, gather_dim)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_output = _all_to_all(
+            grad_output,
+            ctx.world_size,
+            ctx.process_group,
+            ctx.gather_dim,
+            ctx.scatter_dim,
+        )
+        return (
+            grad_output,
+            None,
+            None,
+            None,
+        )
+
+def all_to_all(
+    input_: torch.Tensor,
+    process_group: dist.ProcessGroup,
+    scatter_dim: int = 2,
+    gather_dim: int = 1,
+):
+    return _AllToAll.apply(input_, process_group, scatter_dim, gather_dim)
+    
 class FNOBlocks(nn.Module):
     def __init__(
         self,
@@ -77,6 +133,11 @@ class FNOBlocks(nn.Module):
         self.separable = separable
         self.preactivation = preactivation
         self.ada_in_features = ada_in_features
+
+        try:
+            self.group = torch.distributed.distributed_c10d._get_default_group()
+        except:
+            pass
 
         self.convs = SpectralConv(
             self.in_channels,
@@ -205,8 +266,10 @@ class FNOBlocks(nn.Module):
         if self.stabilizer == "tanh":
             x = torch.tanh(x)
 
+        x = all_to_all(x, self.group, scatter_dim=1, gather_dim=2)
         x_fno = self.convs(x, index, output_shape=output_shape)
-
+        x_fno = all_to_all(x_fno, self.group, scatter_dim=2, gather_dim=1)
+        
         if self.norm is not None:
             x_fno = self.norm[self.n_norms * index](x_fno)
 
